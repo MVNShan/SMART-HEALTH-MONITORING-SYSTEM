@@ -1,0 +1,114 @@
+// Smart Health Monitoring System Using Cloud (ThingSpeak version)
+// Board: NodeMCU 1.0 (ESP-12E Module) - ESP8266
+// Sensors: DHT11 (temperature + humidity) and Pulse Sensor (heart/pulse rate)
+
+#include <ESP8266WiFi.h>
+#include <ThingSpeak.h>
+#include <DHT.h>
+
+// ---------- Pins ----------
+#define DHTPIN D2
+#define DHTTYPE DHT11
+#define PULSE_PIN A0
+
+// ---------- Your settings (fill these in) ----------
+const char* ssid = "Wifi Name ";
+const char* password = "Wifi-Password";
+unsigned long channelID = xxxxxx;  // your ThingSpeak Channel ID
+const char* writeAPIKey = "Your APIKey";
+
+DHT dht(DHTPIN, DHTTYPE);
+WiFiClient client;
+
+// ---------- Pulse detection variables ----------
+int minV = 1023, maxV = 0, threshold = 550;
+bool above = false;
+unsigned long lastBeat = 0, lastSample = 0, lastWindow = 0, lastSend = 0;
+float bpm = 0;
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+}
+
+void readPulse() {
+  unsigned long now = millis();
+  if (now - lastSample < 20) return;       // sample every 20 ms
+  lastSample = now;
+
+  int v = analogRead(PULSE_PIN);
+  if (v < minV) minV = v;
+  if (v > maxV) maxV = v;
+
+  // Update adaptive threshold every 2 seconds
+  if (now - lastWindow > 2000) {
+    if (maxV - minV > 40) threshold = (minV + maxV) / 2;
+    minV = 1023;
+    maxV = 0;
+    lastWindow = now;
+  }
+
+  // Beat detected when the signal crosses the threshold upwards
+  if (v > threshold && !above && (now - lastBeat) > 300) {
+    unsigned long interval = now - lastBeat;
+    if (lastBeat > 0 && interval < 2000) {
+      float instant = 60000.0 / interval;
+      if (instant > 40 && instant < 180) {
+        bpm = (bpm == 0) ? instant : (0.7 * bpm + 0.3 * instant);
+      }
+    }
+    lastBeat = now;
+    above = true;
+  }
+  if (v < threshold - 20) above = false;
+
+  // No beat for 3 seconds = no finger on the sensor
+  if (now - lastBeat > 3000) bpm = 0;
+}
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  WiFi.mode(WIFI_STA);
+  ThingSpeak.begin(client);
+  connectWiFi();
+}
+
+void loop() {
+  readPulse();
+
+  // Send to ThingSpeak every 20 seconds
+  if (millis() - lastSend >= 20000) {
+    lastSend = millis();
+    connectWiFi();
+
+    float temperatureC = dht.readTemperature();
+    float humidity = dht.readHumidity();
+
+    if (!isnan(temperatureC) && !isnan(humidity)) {
+      ThingSpeak.setField(1, temperatureC);
+      ThingSpeak.setField(2, humidity);
+    } else {
+      Serial.println("DHT11 reading failed!");
+    }
+    ThingSpeak.setField(3, (int)bpm);
+
+    int code = ThingSpeak.writeFields(channelID, writeAPIKey);
+
+    Serial.print("Temp: ");
+    Serial.print(temperatureC);
+    Serial.print(" C | Humidity: ");
+    Serial.print(humidity);
+    Serial.print(" % | BPM: ");
+    Serial.print((int)bpm);
+    Serial.print(" | ThingSpeak: ");
+    Serial.println(code == 200 ? "OK" : "Error " + String(code));
+  }
+  yield();
+}
